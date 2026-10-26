@@ -38,6 +38,10 @@ public:
 	// Raycast to perches and start perch
 	UFUNCTION(BlueprintCallable, Category = "Perch")
 	void TryStartPerch();
+
+	// Perform perch
+	UFUNCTION(BlueprintCallable, Category = "Perch")
+	void PerchTo(float DeltaTime);
 	
 protected:
 	// Called when the game starts or when spawned

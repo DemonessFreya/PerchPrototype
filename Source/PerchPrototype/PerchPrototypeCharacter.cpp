@@ -8,6 +8,8 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "InputActionValue.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Kismet/GameplayStatics.h"
 
 // Sets default values
 APerchPrototypeCharacter::APerchPrototypeCharacter()
@@ -37,6 +39,7 @@ void APerchPrototypeCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	PerchTo(DeltaTime);
 }
 
 // Called to bind functionality to input
@@ -56,6 +59,17 @@ void APerchPrototypeCharacter::SetupPlayerInputComponent(UInputComponent* Player
 
 void APerchPrototypeCharacter::HandlePerchInput(const FInputActionValue& Value)
 {
+	if (CurrentPerchState == EPerchState::PERCHING)
+	{
+		CurrentPerchState = EPerchState::WALKING;
+
+		GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Walking);
+
+		TargetPerch = nullptr;
+		UE_LOG(LogTemp, Warning, TEXT("Broke off perch!"));
+		return;
+	}
+
 	// Call raycast
 	TryStartPerch();
 }
@@ -75,54 +89,124 @@ void APerchPrototypeCharacter::TryStartPerch()
 	FVector CameraLocation;
 	FRotator CameraRotation;
 	PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
+	FVector CameraForward = CameraRotation.Vector();
 
-	// Define start of raycast
-	FVector TraceStart = CameraLocation;
-	FVector TraceEnd = TraceStart + (CameraRotation.Vector() * 5000.f);
+	// Find all perch actors in level
+	TArray<AActor*> AllPerches;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), APerchActor::StaticClass(), AllPerches);
 
-	FHitResult HitResult;
-	FCollisionQueryParams QueryParams;
-	QueryParams.AddIgnoredActor(this); // raycast can't hit player character
+	APerchActor* BestPerch = nullptr;
+	float BestScore = -1.0f; // Higher dot product means closer to crosshair
+	FVector BestHitLocation = FVector::ZeroVector;
 
-	float SphereRadius = 60.0f;
-	FCollisionShape SphereShape = FCollisionShape::MakeSphere(SphereRadius);
+	float MaxRange = 5000.0f;
+	// Adjust angle to make targeting window tighter or larger
+	float MaxAngleCos = FMath::Cos(FMath::DegreesToRadians(5.0f));
 
-	// Perform sphere sweep
-	bool bHit = GetWorld()->SweepSingleByChannel
-	(
-		HitResult,
-		TraceStart,
-		TraceEnd,
-		FQuat::Identity,
-		ECC_Visibility,
-		SphereShape,
-		QueryParams
-	);
-
-	// Check what was hit
-	if (bHit && HitResult.GetActor())
+	for (AActor* Actor : AllPerches)
 	{
-		// Try cast actor to APerchActor class
-		if (APerchActor* HitPerch = Cast<APerchActor>(HitResult.GetActor()))
-		{
-			// Hit perch actor
-			TargetPerch = HitPerch;
-			StartPerchLocation = GetActorLocation();
-			PerchProgress = 0.0f;
-			CurrentPerchState = EPerchState::PERCHING;
+		APerchActor* Perch = Cast<APerchActor>(Actor);
+		if (!IsValid(Perch)) continue;
 
-			// Debug line to view where raycast is (hit perch actor)
-			DrawDebugLine(GetWorld(), TraceStart, HitResult.Location, FColor::Green, false, 2.0f, 0, 2.0f);
-		}
-		else
+		FVector PerchLocation = Perch->GetActorLocation();
+		float DistSq = FVector::DistSquared(CameraLocation, PerchLocation);
+
+		// Ignore perches outside of max distance
+		if (DistSq > (MaxRange * MaxRange)) continue;
+
+		FVector DirectionToPerch = (PerchLocation - CameraLocation).GetSafeNormal();
+		float DotProduct = FVector::DotProduct(CameraForward, DirectionToPerch);
+
+		// Ignore perches outside cone
+		if (DotProduct < MaxAngleCos) continue;
+
+		// Check line of sight
+		FHitResult LoSHit;
+		FCollisionQueryParams QueryParams;
+		QueryParams.AddIgnoredActor(this);
+		QueryParams.AddIgnoredActor(Perch);
+
+		bool bHitSomething = GetWorld()->LineTraceSingleByChannel
+		(
+			LoSHit,
+			CameraLocation,
+			PerchLocation,
+			ECC_Visibility,
+			QueryParams
+		);
+
+		// If something was hit before reaching perch
+		if (bHitSomething) continue;
+
+		// Select best perch
+		if (DotProduct > BestScore)
 		{
-			// Debug line to view where raycast is (missed perch actor)
-			DrawDebugLine(GetWorld(), TraceStart, HitResult.Location, FColor::Yellow, false, 2.0f, 0, 2.0f);
+			BestScore = DotProduct;
+			BestPerch = Perch;
+			BestHitLocation = PerchLocation;
 		}
+	}
+
+	// Handle final selection
+	if (BestPerch)
+	{
+		TargetPerch = BestPerch;
+		StartPerchLocation = GetActorLocation();
+		CurrentPerchState = EPerchState::PERCHING;
+
+		GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_None);
+		GetCharacterMovement()->Velocity = FVector::ZeroVector;
+
+		// Green debug line showing successful target lock
+		DrawDebugLine(GetWorld(), CameraLocation, BestHitLocation, FColor::Green, false, 2.0f, 0, 2.0f);
+		UE_LOG(LogTemp, Warning, TEXT("Successfully locked onto perch via cone targeting!"));
 	}
 	else
 	{
-		// Debug line to view where raycast is (missed perch actor, out of bounds)
-		DrawDebugLine(GetWorld(), TraceStart, TraceEnd, FColor::Red, false, 2.0f, 0, 2.0f);
+		// Red debug line showing no valid unblocked perches found
+		DrawDebugLine(GetWorld(), CameraLocation, CameraLocation + (CameraForward * 1000.f), FColor::Red, false, 2.0f, 0, 2.0f);
+		UE_LOG(LogTemp, Warning, TEXT("No valid unblocked perch found in range/cone."));
+	}
+}
+
+void APerchPrototypeCharacter::PerchTo(float DeltaTime)
+{
+	// If we are currently flying toward a perch actor
+	if (CurrentPerchState == EPerchState::PERCHING)
+	{
+		if (TargetPerch)
+		{
+			// Get where perch is
+			FVector TargetLocation = TargetPerch->GetActorLocation() + FVector(0.f, 0.f, 75.f);
+
+			// Interpolate to target vector
+			FVector NewLocation = FMath::VInterpTo(GetActorLocation(), TargetLocation, DeltaTime, 10.0f);
+			SetActorLocation(NewLocation);
+
+			// Check if arrived (threshold: 15.0f)
+			float DistanceToTarget = FVector::Dist(GetActorLocation(), TargetLocation);
+			if (DistanceToTarget < 15.0f)
+			{
+				// Snap to perch position to avoid overshoot (replace with integral?)
+				SetActorLocation(TargetLocation);
+
+				GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Walking);
+
+				// Transition to perched state
+				CurrentPerchState = EPerchState::WALKING;
+
+				LaunchCharacter(FVector(0.f, 0.f, 300.f), true, true);
+
+				TargetPerch = nullptr;
+
+				UE_LOG(LogTemp, Warning, TEXT("Successfully Arrived!"));
+			}
+		}
+		else
+		{
+			// Fallback to walking state if perching blocked somehow
+			CurrentPerchState = EPerchState::WALKING;
+			GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Walking);
+		}
 	}
 }
